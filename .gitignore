@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pt
+*.tmp
+checkpoints/
+cindy_ckpts/
+cindy_data/
+data/
+.hf/
+.cache/
