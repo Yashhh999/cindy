@@ -21,7 +21,7 @@ Training augmentations are JPEG 60–95, random crop, downscale-upscale, and blu
 
 ## Checkpoints
 
-Every 50 steps the trainer writes `/kaggle/working/cindy_ckpts/latest.pt` (LoRA + frequency CNN + head + Adam state, not the frozen CLIP weights) and uploads it to the Hugging Face **model** repo `Yashhh999/cindy` at `checkpoints/latest.pt`.
+Every 50 steps the trainer writes `/kaggle/working/cindy_ckpts/latest.pt` (LoRA + frequency CNN + head + Adam state, not the frozen CLIP weights). Hugging Face gets one commit every 400 steps (`latest.pt`, `latest.json`, and `best.pt` together) so the hub rate limit is not burned. A 429 is retried with backoff.
 
 Resume rule:
 
@@ -63,7 +63,7 @@ os.chdir(repo)
 subprocess.check_call([
     "torchrun", "--standalone", "--nproc_per_node=2", "-m", "cindy.train",
     "--hf-repo", "Yashhh999/cindy",
-    "--save-every", "50", "--hf-every", "50",
+    "--save-every", "50", "--hf-every", "400",
     "--batch-size", "16", "--max-steps", "8000",
     "--per-model", "500", "--holdout", "lumina",
     "--v2-root", "/kaggle/input",
