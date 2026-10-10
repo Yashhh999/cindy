@@ -1,7 +1,8 @@
-"""Train Cindy on 2x T4. Checkpoints every few steps.
+"""OpenFake era trainer for 2x T4.
 
-Resume rule: if /kaggle/working/cindy_ckpts has a file, use it.
-If that folder is empty, download checkpoints/latest.pt from the HF model repo.
+Round 1 starts a new LoRA and head. Later rounds load latest.pt.
+The frozen CLIP base never changes. A killed Kaggle session resumes from
+progress.json (local first, otherwise Hugging Face).
 """
 
 from __future__ import annotations
@@ -24,8 +25,27 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms
 
-from cindy.checkpoint import Uploader, atomic_torch_save, ckpt_dir, hf_token, resolve_resume
-from cindy.data import prepare
+from cindy.checkpoint import (
+    Uploader,
+    atomic_torch_save,
+    ckpt_dir,
+    delete_remote_weights,
+    download_hf,
+    download_progress,
+    find_local,
+    fresh_progress,
+    hf_token,
+    load_progress,
+    save_progress,
+)
+from cindy.data import (
+    delete_era_files,
+    era_names,
+    era_ready,
+    fill_era,
+    list_split,
+    wipe_old_caches,
+)
 from cindy.model import ARCH, build_model
 
 
@@ -36,45 +56,21 @@ def parse_args():
     p.add_argument("--hf-every", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--max-steps", type=int, default=8000)
+    p.add_argument("--steps-per-era", type=int, default=4000)
+    p.add_argument("--per-gen", type=int, default=2000)
+    p.add_argument("--replay-per", type=int, default=300)
+    p.add_argument("--scan-chunk", type=int, default=200000)
+    p.add_argument("--min-free-gb", type=float, default=3.0)
     p.add_argument("--lr-lora", type=float, default=1e-4)
     p.add_argument("--lr-head", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup", type=int, default=100)
-    p.add_argument("--per-model", type=int, default=8000)
-    p.add_argument("--dragon-train", type=int, default=160000)
-    p.add_argument("--val-per-model", type=int, default=40)
-    p.add_argument("--holdout-val", type=int, default=200)
-    p.add_argument("--holdout", default="lumina")
-    p.add_argument("--max-scan", type=int, default=1200000)
-    p.add_argument("--real-count", type=int, default=8000)
-    p.add_argument("--v2-root", default="")
-    p.add_argument("--real-root", default="")
-    p.add_argument("--v2-total", type=int, default=70000)
-    p.add_argument("--v2-per-gen", type=int, default=8000)
     p.add_argument("--val-every", type=int, default=400)
-    p.add_argument("--log-every", type=int, default=20)
+    p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--no-grad-checkpoint", action="store_true")
-    p.add_argument("--no-coco", action="store_true")
-    p.add_argument("--no-flickr", action="store_true")
-    p.add_argument("--smoke", action="store_true")
     args, _unknown = p.parse_known_args()
-    if args.smoke:
-        args.per_model = 4
-        args.dragon_train = 8
-        args.v2_total = 8
-        args.val_per_model = 2
-        args.holdout_val = 2
-        args.max_steps = 4
-        args.save_every = 2
-        args.hf_every = 2
-        args.real_count = 8
-        args.max_scan = 400
-        args.num_workers = 0
-        args.batch_size = 2
-        args.val_every = 2
     return args
 
 
@@ -142,21 +138,17 @@ class ListDataset(Dataset):
             return torch.zeros(3, 224, 224), float(label)
 
 
-def make_balanced(manifest):
-    reals = [(p, 0) for p in manifest["train_real"]]
-    fakes = [(item["path"], 1) for item in manifest["train_fake"]]
+def make_balanced(items):
+    reals = [it for it in items if it[1] == 0]
+    fakes = [it for it in items if it[1] == 1]
+    if not reals or not fakes:
+        return items
     n = 2 * max(len(reals), len(fakes))
-    items = []
+    out = []
     for i in range(n // 2):
-        items.append(reals[i % len(reals)])
-        items.append(fakes[i % len(fakes)])
-    return items
-
-
-def make_val(manifest):
-    items = [(p, 0) for p in manifest["val_real"]]
-    items += [(item["path"], 1) for item in manifest["val_fake"]]
-    return items
+        out.append(reals[i % len(reals)])
+        out.append(fakes[i % len(fakes)])
+    return out
 
 
 def binary_auc(labels, scores):
@@ -166,7 +158,6 @@ def binary_auc(labels, scores):
     neg = scores[labels == 0]
     if len(pos) == 0 or len(neg) == 0:
         return float("nan")
-    # Mann-Whitney with average ranks for ties.
     order = np.argsort(scores, kind="mergesort")
     ranks = np.empty(len(scores), dtype=np.float64)
     i = 0
@@ -174,9 +165,7 @@ def binary_auc(labels, scores):
         j = i
         while j + 1 < len(scores) and scores[order[j + 1]] == scores[order[i]]:
             j += 1
-        # ranks are 1-based
-        avg = 0.5 * (i + j) + 1
-        ranks[order[i : j + 1]] = avg
+        ranks[order[i : j + 1]] = 0.5 * (i + j) + 1
         i = j + 1
     sum_pos = ranks[labels == 1].sum()
     return float((sum_pos - len(pos) * (len(pos) + 1) / 2) / (len(pos) * len(neg)))
@@ -184,16 +173,16 @@ def binary_auc(labels, scores):
 
 @torch.no_grad()
 def evaluate(model, loader, device):
-    was_training = model.training
+    was = model.training
     model.eval()
     scores, labels = [], []
     for images, target in loader:
         images = images.to(device, non_blocking=True)
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
             logit = model(images)
         scores.append(torch.sigmoid(logit.float()).cpu())
         labels.append(target)
-    model.train(was_training)
+    model.train(was)
     y = torch.cat(labels).numpy()
     s = torch.cat(scores).numpy()
     pred = (s >= 0.5).astype(np.float64)
@@ -205,10 +194,10 @@ def set_lr(opt, step, args):
     if step < args.warmup:
         scale = step / max(1, args.warmup)
     else:
-        progress = (step - args.warmup) / max(1, args.max_steps - args.warmup)
-        scale = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
-    bases = [args.lr_lora, args.lr_head]
-    for group, base in zip(opt.param_groups, bases):
+        span = max(1, args.steps_per_era - args.warmup)
+        progress = min(1.0, (step - args.warmup) / span)
+        scale = 0.5 * (1 + math.cos(math.pi * progress))
+    for group, base in zip(opt.param_groups, (args.lr_lora, args.lr_head)):
         group["lr"] = base * scale
 
 
@@ -224,20 +213,31 @@ def trainable_params(model):
     return lora, head
 
 
-def save_checkpoint(model, opt, scaler, step, best_auc, args, path: Path):
+def save_checkpoint(model, opt, scaler, progress, args, path: Path):
     raw = model.module if isinstance(model, DDP) else model
     payload = {
         "arch": ARCH,
-        "step": step,
-        "best_auc": best_auc,
+        "step": int(progress["global_step"]),
+        "step_in_era": int(progress["step_in_era"]),
+        "best_auc": float(progress["best_auc"]),
+        "era": progress.get("era"),
+        "era_index": int(progress["era_index"]),
         "model": raw.trainable_state(),
         "optimizer": opt.state_dict(),
         "scaler": scaler.state_dict(),
         "args": vars(args),
     }
     atomic_torch_save(payload, path)
-    meta = {"step": step, "best_auc": best_auc, "arch": ARCH, "time": time.time()}
+    meta = {
+        "arch": ARCH,
+        "step": int(progress["global_step"]),
+        "era": progress.get("era"),
+        "era_index": int(progress["era_index"]),
+        "best_auc": float(progress["best_auc"]),
+        "time": time.time(),
+    }
     (path.parent / "latest.json").write_text(json.dumps(meta))
+    save_progress(progress)
 
 
 def load_checkpoint(model, opt, scaler, path: Path, device):
@@ -256,57 +256,84 @@ def load_checkpoint(model, opt, scaler, path: Path, device):
                     state[key] = value.to(device)
     if scaler is not None and ckpt.get("scaler"):
         scaler.load_state_dict(ckpt["scaler"])
-    return int(ckpt.get("step", 0)), float(ckpt.get("best_auc", 0.0))
+    return ckpt
+
+
+def startup(args, log):
+    local_progress = load_progress()
+    if local_progress and local_progress.get("arch") == ARCH:
+        log(f"resume local era={local_progress.get('era')} step={local_progress.get('global_step')}")
+        return local_progress, find_local()
+    remote = download_progress(args.hf_repo, log=log)
+    if remote and remote.get("arch") == ARCH:
+        path = download_hf(args.hf_repo, log=log)
+        log(f"resume huggingface era={remote.get('era')} step={remote.get('global_step')}")
+        return remote, path
+    token = hf_token()
+    if token:
+        delete_remote_weights(args.hf_repo, token, log=log)
+    wipe_old_caches(log=log)
+    old = ckpt_dir() / "latest.pt"
+    if old.is_file():
+        old.unlink()
+        log("removed local v1 checkpoint")
+    progress = fresh_progress(ARCH)
+    save_progress(progress)
+    log("fresh v2. eras: " + ",".join(era_names()))
+    return progress, None
+
+
+def advance_era(progress, log):
+    finished = progress.get("era")
+    progress.setdefault("eras_finished", []).append({
+        "era": finished,
+        "fakes": sum((progress.get("gen_counts") or {}).values()),
+        "reals": int(progress.get("real_count") or 0),
+        "step": int(progress.get("global_step") or 0),
+    })
+    delete_era_files(finished, log=log)
+    progress["era_index"] = int(progress["era_index"]) + 1
+    progress["scanned"] = 0
+    progress["gen_counts"] = {}
+    progress["real_count"] = 0
+    progress["stream_done"] = False
+    progress["step_in_era"] = 0
+    if progress["era_index"] >= len(era_names()):
+        progress["done"] = True
+        progress["era"] = "done"
+    else:
+        progress["era"] = era_names()[progress["era_index"]]
+    log(f"finished {finished}. next={progress['era']} global_step={progress['global_step']}")
+    return progress
 
 
 def main():
     args = parse_args()
     rank, world, local = init_dist()
     device = torch.device("cuda", local) if torch.cuda.is_available() else torch.device("cpu")
-    seed = 42 + rank
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(42 + rank)
+    np.random.seed(42 + rank)
+    torch.manual_seed(42 + rank)
 
+    progress, resume_path = None, None
     if rank == 0:
         if not hf_token():
-            raise SystemExit("Set HF_TOKEN (write access to the Yashhh999/cindy model repo).")
-        manifest = prepare(args, log=lambda m: log(0, m))
+            raise SystemExit("Set HF_TOKEN (write access to Yashhh999/cindy).")
+        progress, resume_path = startup(args, log=lambda m: log(0, m))
+        save_progress(progress)
     if world > 1:
         dist.barrier()
     if rank != 0:
-        from cindy.data import _load_partial
-        manifest = _load_partial()
-    if manifest is None or not manifest.get("train_fake"):
-        raise RuntimeError("manifest missing after prepare")
+        progress = load_progress()
+    if progress is None:
+        raise RuntimeError("progress.json missing")
 
-    if rank == 0:
-        model = build_model(
-            rank0_log=lambda m: log(0, m),
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            grad_checkpoint=not args.no_grad_checkpoint,
-        )
-    if world > 1:
-        dist.barrier()
-    if rank != 0:
-        model = build_model(
-            rank0_log=lambda m: None,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            grad_checkpoint=not args.no_grad_checkpoint,
-        )
-    model = model.to(device)
-
-    resume_path = None
-    if rank == 0:
-        resume_path = resolve_resume(args.hf_repo, log=lambda m: log(0, m))
-    if world > 1:
-        dist.barrier()
-    if rank != 0:
-        from cindy.checkpoint import find_local
-        resume_path = find_local()
-
+    model = build_model(
+        rank0_log=lambda m: log(rank, m),
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        grad_checkpoint=not args.no_grad_checkpoint,
+    ).to(device)
     lora_params, head_params = trainable_params(model)
     opt = torch.optim.AdamW(
         [
@@ -319,54 +346,29 @@ def main():
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     except (TypeError, AttributeError):
         scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
-    start, best_auc = 0, 0.0
-    if resume_path is not None:
-        start, best_auc = load_checkpoint(model, opt, scaler, resume_path, device)
-        log(rank, f"loaded step {start} best_auc {best_auc:.4f} from {resume_path}")
-    if start >= args.max_steps:
-        args.max_steps = start + args.max_steps
-        log(rank, f"checkpoint already reached the old target. extending max_steps to {args.max_steps}")
-
+    if resume_path is not None and rank == 0:
+        load_checkpoint(model, opt, scaler, resume_path, device)
+        log(0, f"loaded weights step {progress['global_step']} era {progress['era']}")
     if world > 1:
+        dist.barrier()
+        if rank != 0 and find_local() is not None:
+            load_checkpoint(model, opt, scaler, find_local(), device)
         model = DDP(model, device_ids=[local], output_device=local, find_unused_parameters=False)
 
-    train_items = make_balanced(manifest)
-    val_items = make_val(manifest)
-    train_ds = ListDataset(train_items, train=True)
-    sampler = DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=True, drop_last=True) if world > 1 else None
-    if len(train_ds) < args.batch_size * world:
-        raise RuntimeError(
-            f"only {len(train_ds)} training rows for batch {args.batch_size} x {world} gpus"
-        )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=True,
-        persistent_workers=args.num_workers > 0,
-    )
-    val_loader = None
-    if rank == 0:
-        val_loader = DataLoader(ListDataset(val_items, train=False), batch_size=args.batch_size, shuffle=False, num_workers=0)
-
     uploader = Uploader(args.hf_repo, hf_token(), log=lambda m: log(0, m)) if rank == 0 else None
-    state = {"step": start, "best_auc": best_auc}
 
     def dump(reason: str):
         if rank != 0:
             return
         path = ckpt_dir() / "latest.pt"
-        save_checkpoint(model, opt, scaler, state["step"], state["best_auc"], args, path)
-        log(0, f"saved {path} at step {state['step']} ({reason})")
+        save_checkpoint(model, opt, scaler, progress, args, path)
+        log(0, f"saved step {progress['global_step']} era {progress['era']} ({reason})")
         if uploader is not None:
             uploader.submit(path)
             uploader.flush(180)
 
     def on_signal(signum, _frame):
-        log(rank, f"signal {signum}. saving before exit.")
+        log(rank, f"signal {signum}. saving.")
         dump("signal")
         raise SystemExit(0)
 
@@ -374,57 +376,126 @@ def main():
         signal.signal(signal.SIGTERM, on_signal)
         signal.signal(signal.SIGINT, on_signal)
 
-    step = start
-    epoch = 0
-    model.train()
-    log(rank, f"training steps {step} -> {args.max_steps} on {world} gpu(s), batch {args.batch_size}/gpu")
-    while step < args.max_steps:
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-        t0 = time.time()
-        for images, target in train_loader:
-            if step >= args.max_steps:
-                break
-            images = images.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            # 0.02 label smoothing, still a binary real/fake loss
-            smooth = target * 0.96 + 0.02
-            set_lr(opt, step, args)
-            opt.zero_grad(set_to_none=True)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
-                logit = model(images)
-                loss = F.binary_cross_entropy_with_logits(logit, smooth)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_((lora_params + head_params), 1.0)
-            scaler.step(opt)
-            scaler.update()
-            step += 1
-            state["step"] = step
-            if step % args.log_every == 0:
-                dt = (time.time() - t0) / args.log_every
-                log(rank, f"step {step} loss {loss.item():.4f} lr {opt.param_groups[0]['lr']:.2e} {dt:.2f}s/step")
-                t0 = time.time()
-            if rank == 0 and step % args.save_every == 0:
-                path = ckpt_dir() / "latest.pt"
-                save_checkpoint(model, opt, scaler, step, state["best_auc"], args, path)
-                log(0, f"checkpoint step {step}")
-                if uploader is not None and step % args.hf_every == 0:
-                    uploader.submit(path)
-            if step % args.val_every == 0 and val_loader is not None and len(val_items) > 0:
-                raw = model.module if isinstance(model, DDP) else model
-                metrics = evaluate(raw, val_loader, device)
-                log(0, f"val step {step} acc {metrics['acc']:.4f} auc {metrics['auc']:.4f} n {metrics['n']}")
-                if metrics["auc"] == metrics["auc"] and metrics["auc"] > state["best_auc"]:
-                    state["best_auc"] = metrics["auc"]
-                    best = ckpt_dir() / "best.pt"
-                    save_checkpoint(model, opt, scaler, step, state["best_auc"], args, best)
-                    log(0, f"new best auc {state['best_auc']:.4f} (kept local; Hugging Face gets it on the next upload)")
-            if world > 1 and step % args.val_every == 0:
-                dist.barrier()
-        epoch += 1
+    while not progress.get("done"):
+        if rank == 0 and not progress.get("stream_done"):
+            progress = fill_era(progress, args, log=lambda m: log(0, m))
+            save_progress(progress)
+            fakes = sum((progress.get("gen_counts") or {}).values())
+            log(0, f"era {progress['era']} fakes={fakes} reals={progress['real_count']} scanned={progress['scanned']}")
+        if world > 1:
+            dist.barrier()
+            progress = load_progress()
 
-    dump("finished")
+        if progress.get("stream_done") and not era_ready(progress):
+            if rank == 0:
+                log(0, f"era {progress['era']} has nothing to train. advancing.")
+                progress = advance_era(progress, log=lambda m: log(0, m))
+                save_progress(progress)
+            if world > 1:
+                dist.barrier()
+                progress = load_progress()
+            continue
+
+        train_items, val_items = list_split(progress["era"])
+        train_items = make_balanced(train_items)
+        if len(train_items) < args.batch_size * world:
+            if rank == 0:
+                log(0, "not enough images yet")
+                if progress.get("stream_done"):
+                    progress = advance_era(progress, log=lambda m: log(0, m))
+                    save_progress(progress)
+            if world > 1:
+                dist.barrier()
+                progress = load_progress()
+            continue
+
+        train_ds = ListDataset(train_items, train=True)
+        sampler = DistributedSampler(train_ds, num_replicas=world, rank=rank, shuffle=True, drop_last=True) if world > 1 else None
+        loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=True,
+            persistent_workers=args.num_workers > 0,
+        )
+        val_loader = None
+        if rank == 0 and val_items:
+            val_loader = DataLoader(ListDataset(val_items, train=False), batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+        target = int(progress["step_in_era"]) + args.steps_per_era
+        log(rank, f"train era {progress['era']} steps {progress['step_in_era']} -> {target}")
+        model.train()
+        epoch = 0
+        done_steps = False
+        while int(progress["step_in_era"]) < target:
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            t0 = time.time()
+            for images, target_y in loader:
+                if int(progress["step_in_era"]) >= target:
+                    done_steps = True
+                    break
+                images = images.to(device, non_blocking=True)
+                target_y = target_y.to(device, non_blocking=True)
+                smooth = target_y * 0.96 + 0.02
+                set_lr(opt, int(progress["step_in_era"]), args)
+                opt.zero_grad(set_to_none=True)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
+                    main, aux = model(images)
+                    loss = F.binary_cross_entropy_with_logits(main, smooth)
+                    loss = loss + 0.5 * F.binary_cross_entropy_with_logits(aux, smooth)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(lora_params + head_params, 1.0)
+                scaler.step(opt)
+                scaler.update()
+                progress["step_in_era"] = int(progress["step_in_era"]) + 1
+                progress["global_step"] = int(progress["global_step"]) + 1
+                step = int(progress["global_step"])
+                if step % args.log_every == 0:
+                    dt = (time.time() - t0) / args.log_every
+                    log(rank, f"step {step} era {progress['era']} loss {loss.item():.4f} {dt:.2f}s/step")
+                    t0 = time.time()
+                if rank == 0 and step % args.save_every == 0:
+                    path = ckpt_dir() / "latest.pt"
+                    save_checkpoint(model, opt, scaler, progress, args, path)
+                    if uploader is not None and step % args.hf_every == 0:
+                        uploader.submit(path)
+                if step % args.val_every == 0 and val_loader is not None and len(val_items) > 1:
+                    raw = model.module if isinstance(model, DDP) else model
+                    metrics = evaluate(raw, val_loader, device)
+                    log(0, f"check step {step} era {progress['era']} acc {metrics['acc']:.3f} auc {metrics['auc']:.3f} n {metrics['n']}")
+                    if metrics["auc"] == metrics["auc"] and metrics["auc"] > float(progress["best_auc"]):
+                        progress["best_auc"] = metrics["auc"]
+                        save_checkpoint(model, opt, scaler, progress, args, ckpt_dir() / "best.pt")
+                        save_checkpoint(model, opt, scaler, progress, args, ckpt_dir() / "latest.pt")
+                if world > 1 and step % args.val_every == 0:
+                    dist.barrier()
+            epoch += 1
+            if done_steps:
+                break
+            if epoch > 100000:
+                break
+
+        if rank == 0:
+            dump("era-chunk")
+            if progress.get("stream_done"):
+                progress = advance_era(progress, log=lambda m: log(0, m))
+            else:
+                delete_era_files(progress["era"], log=lambda m: log(0, m))
+                progress["step_in_era"] = 0
+                log(0, f"freed {progress['era']} images. replay kept. scan continues at {progress['scanned']}")
+            save_progress(progress)
+        if world > 1:
+            dist.barrier()
+            progress = load_progress()
+
+    if rank == 0:
+        dump("finished")
+        log(0, "all eras finished " + json.dumps(progress.get("eras_finished")))
     if world > 1:
         dist.barrier()
         dist.destroy_process_group()

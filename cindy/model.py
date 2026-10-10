@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-ARCH = "cindy-vitb16-lora-freq-v1"
+ARCH = "cindy-vitb16-lora-freq-v2"
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
@@ -169,8 +169,11 @@ class CindyDetector(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(384, 1),
         )
+        self.freq_head = nn.Linear(freq_dim, 1)
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
+        nn.init.zeros_(self.freq_head.weight)
+        nn.init.zeros_(self.freq_head.bias)
         mean = torch.tensor(CLIP_MEAN).view(1, 3, 1, 1)
         std = torch.tensor(CLIP_STD).view(1, 3, 1, 1)
         self.register_buffer("mean", mean, persistent=False)
@@ -199,11 +202,19 @@ class CindyDetector(nn.Module):
         patches = v.ln_post(x[:, 1:]).mean(dim=1)
         return cls, patches
 
-    def forward(self, images_01):
+    def logits(self, images_01):
         freq = self.freq(images_01)
         normed = (images_01 - self.mean) / self.std
         cls, patches = self.encode(normed)
-        return self.head(torch.cat([cls, patches, freq], dim=-1)).squeeze(-1)
+        main = self.head(torch.cat([cls, patches, freq], dim=-1)).squeeze(-1)
+        aux = self.freq_head(freq).squeeze(-1)
+        return main, aux
+
+    def forward(self, images_01):
+        main, aux = self.logits(images_01)
+        if self.training:
+            return main, aux
+        return main
 
     def trainable_state(self):
         return {n: p.detach().cpu() for n, p in self.named_parameters() if p.requires_grad}

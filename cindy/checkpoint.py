@@ -138,6 +138,9 @@ class Uploader:
             meta = snap.parent / "latest.json"
             if meta.is_file():
                 files.append((meta, "latest.json"))
+            prog = snap.parent / "progress.json"
+            if prog.is_file():
+                files.append((prog, "progress.json"))
             best = snap.parent / "best.pt"
             best_snap = snap.parent / ".upload_best.pt"
             if best.is_file() and best.stat().st_size > 0:
@@ -191,11 +194,94 @@ def download_hf(repo: str, log=print) -> Path | None:
     return dest
 
 
-def resolve_resume(repo: str, log=print) -> Path | None:
-    """Local checkpoint wins. Hugging Face is used only when nothing is saved."""
-    local = find_local()
-    if local is not None:
-        log(f"resume from local checkpoint {local} (not pulling Hugging Face)")
-        return local
-    log("no checkpoint in the Kaggle working dir. pulling the latest from Hugging Face.")
-    return download_hf(repo, log=log)
+def replay_dir() -> Path:
+    path = work_root() / "cindy_replay"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def progress_path() -> Path:
+    return ckpt_dir() / "progress.json"
+
+
+def load_progress() -> dict | None:
+    path = progress_path()
+    if not path.is_file():
+        return None
+    import json
+    return json.loads(path.read_text())
+
+
+def save_progress(payload: dict):
+    import json
+    path = progress_path()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(path)
+
+
+def fresh_progress(arch: str) -> dict:
+    return {
+        "arch": arch,
+        "era_index": 0,
+        "era": "early",
+        "scanned": 0,
+        "gen_counts": {},
+        "real_count": 0,
+        "stream_done": False,
+        "step_in_era": 0,
+        "global_step": 0,
+        "best_auc": 0.0,
+        "done": False,
+        "eras_finished": [],
+    }
+
+
+def delete_remote_weights(repo: str, token: str, log=print):
+    """Drop v1 weights. A v2 progress.json on the hub means resume, not delete."""
+    from huggingface_hub import CommitOperationDelete, HfApi
+
+    api = HfApi(token=token)
+    try:
+        files = api.list_repo_files(repo, repo_type="model")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[hf] cannot list repo ({exc})")
+        return
+    doomed = [
+        name for name in files
+        if name.endswith((".pt", ".bin", ".safetensors")) or name.endswith((".json",))
+        and "readme" not in name.lower()
+    ]
+    if not doomed:
+        log("[hf] no weight files to delete")
+        return
+    api.create_commit(
+        repo_id=repo,
+        repo_type="model",
+        operations=[CommitOperationDelete(path_in_repo=name) for name in doomed],
+        commit_message="delete old cindy weights",
+        token=token,
+    )
+    log(f"[hf] deleted {len(doomed)} file(s)")
+
+
+def download_progress(repo: str, log=print) -> dict | None:
+    token = hf_token()
+    if not token:
+        return None
+    from huggingface_hub import hf_hub_download
+
+    try:
+        remote = hf_hub_download(
+            repo_id=repo,
+            filename="checkpoints/progress.json",
+            repo_type="model",
+            token=token,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"[hf] no v2 progress ({exc})")
+        return None
+    dest = progress_path()
+    dest.write_bytes(Path(remote).read_bytes())
+    log("[hf] downloaded checkpoints/progress.json")
+    return load_progress()
