@@ -35,7 +35,11 @@ subprocess.check_call([
     "--hf-every", "400",
     "--batch-size", "16",
     "--max-steps", "8000",
-    "--per-model", "500",
+    "--dragon-train", "160000",
+    "--per-model", "8000",
+    "--v2-total", "70000",
+    "--v2-per-gen", "8000",
+    "--max-scan", "1200000",
     "--holdout", "lumina",
     "--v2-root", "/kaggle/input",
 ], env=env)
