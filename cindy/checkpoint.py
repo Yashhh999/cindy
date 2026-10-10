@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from pathlib import Path
-
-from cindy.model import ARCH
 
 
 def work_root() -> Path:
@@ -85,14 +82,39 @@ class Uploader:
         if old is not None and old != snap:
             old.unlink(missing_ok=True)
 
-    def _upload_one(self, api, local: Path, remote: str):
-        api.upload_file(
-            path_or_fileobj=str(local),
-            path_in_repo=remote,
-            repo_id=self.repo,
-            repo_type="model",
-            token=self.token,
-        )
+    def _commit(self, api, files: list[tuple[Path, str]]):
+        import time
+        from huggingface_hub import CommitOperationAdd
+
+        ops = [
+            CommitOperationAdd(path_in_repo=f"checkpoints/{name}", path_or_fileobj=str(local))
+            for local, name in files
+            if local.is_file() and local.stat().st_size > 0
+        ]
+        if not ops:
+            return
+        delay = 8
+        last = None
+        for _attempt in range(6):
+            try:
+                api.create_commit(
+                    repo_id=self.repo,
+                    repo_type="model",
+                    operations=ops,
+                    commit_message="cindy checkpoint",
+                    token=self.token,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                text = str(exc).lower()
+                if "429" in text or "rate" in text or "503" in text or "too many" in text:
+                    self.log(f"[hf] rate limit, sleeping {delay}s")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 120)
+                    continue
+                raise
+        raise RuntimeError(f"hf still rate-limited: {last}")
 
     def _drain(self):
         from huggingface_hub import HfApi
@@ -106,21 +128,20 @@ class Uploader:
         while True:
             with self._lock:
                 snap = self._pending
-                extras = getattr(self, "_extras", [])
+                extras = list(getattr(self, "_extras", []))
                 self._pending = None
                 self._extras = []
                 if snap is None:
                     self._running = False
                     return
+            files = [(snap, "latest.pt")]
+            meta = snap.parent / "latest.json"
+            if meta.is_file():
+                files.append((meta, "latest.json"))
+            files.extend(extras)
             try:
-                self._upload_one(api, snap, "checkpoints/latest.pt")
-                arch = snap.parent / "arch.json"
-                if not arch.is_file():
-                    arch.write_text(json.dumps({"arch": ARCH}))
-                self._upload_one(api, arch, "checkpoints/arch.json")
-                for local, name in extras:
-                    self._upload_one(api, local, f"checkpoints/{name}")
-                self.log(f"[hf] pushed checkpoints/latest.pt -> {self.repo}")
+                self._commit(api, files)
+                self.log(f"[hf] pushed {len(files)} file(s) in one commit -> {self.repo}")
                 self._error = None
             except Exception as exc:  # noqa: BLE001
                 self._error = str(exc)
