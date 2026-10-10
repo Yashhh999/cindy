@@ -8,7 +8,7 @@ Real vs AI-image detector for **2× NVIDIA T4**. The base is frozen OpenCLIP **V
 
 Held out even if they appear in train: GPT Image 1.5 and 2.0, nano-banana-pro, Flux.2 Klein 9B, Z-Image Turbo, Recraft v2/v3, Midjourney 7, Ideogram 2.0.
 
-One pass over `core/train`, about 20,000 images at a time (roughly 1%). No per-generator cap. Each chunk is trained for about one epoch, the JPEGs are deleted, and 300 images per generator stay in the replay folder. The scan cursor continues. The checkpoint stays about 20–40 MB.
+One pass over `core/train`. A chunk fills the free disk, about 200,000 images, then trains for one epoch and is deleted. Replay keeps 300 images per generator. No per-generator cap. The checkpoint stays about 20–40 MB.
 
 ## Restart
 
@@ -46,7 +46,7 @@ subprocess.check_call([
     "torchrun", "--standalone", "--nproc_per_node=2", "-m", "cindy.train",
     "--hf-repo", "Yashhh999/cindy",
     "--save-every", "50", "--hf-every", "2000",
-    "--batch-size", "16", "--chunk", "20000",
+    "--batch-size", "16", "--chunk", "250000",
     "--per-gen", "0", "--replay-per", "300",
     "--min-free-gb", "3",
 ], env=os.environ.copy())

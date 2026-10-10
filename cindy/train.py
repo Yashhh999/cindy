@@ -59,7 +59,7 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--steps-per-era", type=int, default=0)
     p.add_argument("--per-gen", type=int, default=0)
-    p.add_argument("--chunk", type=int, default=20000)
+    p.add_argument("--chunk", type=int, default=250000)
     p.add_argument("--replay-per", type=int, default=300)
     p.add_argument("--one-pass", action="store_true", default=True)
     p.add_argument("--min-free-gb", type=float, default=3.0)

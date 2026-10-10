@@ -31,7 +31,7 @@ subprocess.check_call([
     "torchrun", "--standalone", "--nproc_per_node=2", "-m", "cindy.train",
     "--hf-repo", "Yashhh999/cindy",
     "--save-every", "50", "--hf-every", "2000",
-    "--batch-size", "16", "--chunk", "20000",
+    "--batch-size", "16", "--chunk", "250000",
     "--per-gen", "0", "--replay-per", "300",
     "--min-free-gb", "3",
 ], env=os.environ.copy())
