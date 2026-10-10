@@ -12,9 +12,9 @@ Those are fused with the CLIP class token and the mean patch token. Trainable to
 
 ## What it trains on
 
-- **[DRAGON](https://huggingface.co/datasets/lesc-unifi/dragon)** (May 2025): 25 diffusion models, streamed and capped per model. That covers SD 1.5 and SD 2.1, SDXL and its turbo/lightning/flash variants, SD3, Stable Cascade, SSD-1B, Kandinsky 3, Kolors, DeepFloyd IF, PixArt-α / Σ, Flux.1 schnell, LCM, Hyper-SD, Juggernaut XL, Realistic Stock Photo.
+- **[DRAGON](https://huggingface.co/datasets/lesc-unifi/dragon)** (May 2025): **160,000** training fakes, at most 8,000 from any one generator. That covers SD 1.5 and SD 2.1, SDXL and its turbo/lightning/flash variants, SD3, Stable Cascade, SSD-1B, Kandinsky 3, Kolors, DeepFloyd IF, PixArt-α / Σ, Flux.1 schnell, LCM, Hyper-SD, Juggernaut XL, Realistic Stock Photo.
 - **Lumina is held out** of training and kept for validation.
-- **AI-Generated Image Detection v2** (June 2026, paired COCO / ImageNet reals with SD 1.5, SDXL, FLUX.1-schnell, Kandinsky 2.2, PixArt-Sigma, Stable Cascade) if you attach it under `/kaggle/input`. IEEE DataPort is login-gated, so the loader cannot download it. Folder or CSV names containing `real` / `fake` / `flux` / `sdxl` / `kandinsky` / `pixart` / `cascade` are picked up.
+- **AI-Generated Image Detection v2** (June 2026): **70,000** images, split half real and half fake when both sides exist (paired COCO / ImageNet reals with SD 1.5, SDXL, FLUX.1-schnell, Kandinsky 2.2, PixArt-Sigma, Stable Cascade). Attach it under `/kaggle/input`. IEEE DataPort is login-gated, so the loader cannot download it. Folder or CSV names containing `real` / `fake` / `flux` / `sdxl` / `kandinsky` / `pixart` / `cascade` are picked up.
 - **Reals:** COCO val2017, Flickr30k, v2 reals, and optional `--real-root`.
 
 Training augmentations are JPEG 60–95, random crop, downscale-upscale, and blur, so phone and social-media uploads are not a separate domain.
@@ -31,7 +31,7 @@ Resume rule:
 4. SIGTERM (Kaggle killing the session) saves and pushes before exit.
 5. If the saved step is already at `--max-steps`, the target is extended by another `--max-steps` so a finished run does not immediately exit.
 
-`--best.pt` is uploaded when validation AUC improves. Lumina AUC is the generalization check. In-domain accuracy is not.
+`--best.pt` is written locally whenever validation AUC improves and is included in the next Hugging Face commit. Lumina AUC is the generalization check. In-domain accuracy is not.
 
 ## Kaggle
 
@@ -65,12 +65,14 @@ subprocess.check_call([
     "--hf-repo", "Yashhh999/cindy",
     "--save-every", "50", "--hf-every", "400",
     "--batch-size", "16", "--max-steps", "8000",
-    "--per-model", "500", "--holdout", "lumina",
+    "--dragon-train", "160000", "--per-model", "8000",
+    "--v2-total", "70000", "--v2-per-gen", "8000",
+    "--max-scan", "1200000", "--holdout", "lumina",
     "--v2-root", "/kaggle/input",
 ], env=os.environ.copy())
 ```
 
-If step 16 OOMs, change `--batch-size` to `8`. A 500-per-model DRAGON cache is roughly an hour to stream and a few hours to train 8000 steps. Re-running the same cell on a **new** Kaggle session continues from Hugging Face. Re-running it in a session that still has `cindy_ckpts` continues from disk.
+If step 16 OOMs, change `--batch-size` to `8`. Caching 160k DRAGON JPEGs is the slow part (a few hours, about 8 GB). The 500-per-model cache from the earlier run is ignored and rebuilt. Training 8000 steps after that is about an hour at 0.2 s/step. Re-running the same cell on a **new** Kaggle session continues from Hugging Face. Re-running it in a session that still has `cindy_ckpts` continues from disk.
 
 Score a folder after training:
 

@@ -41,15 +41,17 @@ def parse_args():
     p.add_argument("--lr-head", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup", type=int, default=100)
-    p.add_argument("--per-model", type=int, default=500)
+    p.add_argument("--per-model", type=int, default=8000)
+    p.add_argument("--dragon-train", type=int, default=160000)
     p.add_argument("--val-per-model", type=int, default=40)
     p.add_argument("--holdout-val", type=int, default=200)
     p.add_argument("--holdout", default="lumina")
-    p.add_argument("--max-scan", type=int, default=300000)
+    p.add_argument("--max-scan", type=int, default=1200000)
     p.add_argument("--real-count", type=int, default=8000)
     p.add_argument("--v2-root", default="")
     p.add_argument("--real-root", default="")
-    p.add_argument("--v2-per-gen", type=int, default=1500)
+    p.add_argument("--v2-total", type=int, default=70000)
+    p.add_argument("--v2-per-gen", type=int, default=8000)
     p.add_argument("--val-every", type=int, default=400)
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--lora-rank", type=int, default=8)
@@ -61,6 +63,8 @@ def parse_args():
     args, _unknown = p.parse_known_args()
     if args.smoke:
         args.per_model = 4
+        args.dragon_train = 8
+        args.v2_total = 8
         args.val_per_model = 2
         args.holdout_val = 2
         args.max_steps = 4
@@ -162,6 +166,7 @@ def binary_auc(labels, scores):
     neg = scores[labels == 0]
     if len(pos) == 0 or len(neg) == 0:
         return float("nan")
+    # Mann-Whitney with average ranks for ties.
     order = np.argsort(scores, kind="mergesort")
     ranks = np.empty(len(scores), dtype=np.float64)
     i = 0
@@ -169,6 +174,7 @@ def binary_auc(labels, scores):
         j = i
         while j + 1 < len(scores) and scores[order[j + 1]] == scores[order[i]]:
             j += 1
+        # ranks are 1-based
         avg = 0.5 * (i + j) + 1
         ranks[order[i : j + 1]] = avg
         i = j + 1
@@ -381,6 +387,7 @@ def main():
                 break
             images = images.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            # 0.02 label smoothing, still a binary real/fake loss
             smooth = target * 0.96 + 0.02
             set_lr(opt, step, args)
             opt.zero_grad(set_to_none=True)
@@ -412,8 +419,7 @@ def main():
                     state["best_auc"] = metrics["auc"]
                     best = ckpt_dir() / "best.pt"
                     save_checkpoint(model, opt, scaler, step, state["best_auc"], args, best)
-                    if uploader is not None:
-                        uploader.submit(ckpt_dir() / "latest.pt", also=[(best, "best.pt")])
+                    log(0, f"new best auc {state['best_auc']:.4f} (kept local; Hugging Face gets it on the next upload)")
             if world > 1 and step % args.val_every == 0:
                 dist.barrier()
         epoch += 1

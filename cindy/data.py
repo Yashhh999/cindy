@@ -193,7 +193,7 @@ def _label_from_parts(path: Path):
     return decision, gen
 
 
-def scan_v2(root: Path, per_gen: int, log=print):
+def scan_v2(root: Path, per_gen: int, log=print, max_real: int = 10**9, max_fake: int = 10**9):
     reals, fakes = [], []
     counts: dict[str, int] = {}
     if not root or not root.exists():
@@ -204,16 +204,19 @@ def scan_v2(root: Path, per_gen: int, log=print):
         if not path.is_file() or path.suffix.lower() not in IMG_EXT:
             continue
         seen_files += 1
-        if seen_files > 400_000:
+        if seen_files > 800_000:
             break
         kind, gen = _label_from_parts(path)
         if kind == "real":
-            reals.append(str(path))
+            if len(reals) < max_real:
+                reals.append(str(path))
         elif kind == "fake":
-            if counts.get(gen, 0) >= per_gen:
+            if len(fakes) >= max_fake or counts.get(gen, 0) >= per_gen:
                 continue
             counts[gen] = counts.get(gen, 0) + 1
             fakes.append((str(path), gen))
+        if len(reals) >= max_real and len(fakes) >= max_fake:
+            break
     for csv_path in list(root.rglob("*.csv"))[:20]:
         try:
             with csv_path.open(newline="", encoding="utf-8", errors="ignore") as handle:
@@ -227,6 +230,8 @@ def scan_v2(root: Path, per_gen: int, log=print):
                 if path_key is None or label_key is None:
                     continue
                 for row in reader:
+                    if len(reals) >= max_real and len(fakes) >= max_fake:
+                        break
                     raw = row[path_key]
                     image = Path(raw) if Path(raw).is_file() else csv_path.parent / raw
                     if not image.is_file():
@@ -234,9 +239,10 @@ def scan_v2(root: Path, per_gen: int, log=print):
                     label = str(row[label_key]).strip().lower()
                     gen = safe_name(row.get(gen_key, "v2")) if gen_key else "v2"
                     if label in {"0", "real", "human", "nature"}:
-                        reals.append(str(image))
+                        if len(reals) < max_real:
+                            reals.append(str(image))
                     elif label in {"1", "fake", "ai", "synthetic"}:
-                        if counts.get(gen, 0) >= per_gen:
+                        if len(fakes) >= max_fake or counts.get(gen, 0) >= per_gen:
                             continue
                         counts[gen] = counts.get(gen, 0) + 1
                         fakes.append((str(image), gen))
@@ -244,6 +250,26 @@ def scan_v2(root: Path, per_gen: int, log=print):
             log(f"skipping manifest {csv_path}: {exc}")
     log(f"v2/extra reals={len(reals)} fakes={len(fakes)} by {counts}")
     return reals, fakes
+
+
+def _take_v2(reals, fakes, total: int):
+    """Keep `total` June 2026 images, half real and half fake when both exist."""
+    rng = random.Random(1)
+    rng.shuffle(reals)
+    rng.shuffle(fakes)
+    half = total // 2
+    picked_r = list(reals[:half])
+    picked_f = list(fakes[:half])
+    rest = [("r", item) for item in reals[len(picked_r):]] + [("f", item) for item in fakes[len(picked_f):]]
+    rng.shuffle(rest)
+    for kind, item in rest:
+        if len(picked_r) + len(picked_f) >= total:
+            break
+        if kind == "r":
+            picked_r.append(item)
+        else:
+            picked_f.append(item)
+    return picked_r, picked_f
 
 
 def _partial_path() -> Path:
@@ -276,8 +302,8 @@ def _fill_dragon(split, holdouts, quota_for, payload, seen, log, max_scan, allow
         if not allow_train and len(payload["val_fake"]) >= max_val:
             log(f"{split} val cache is full ({len(payload['val_fake'])})")
             break
-        if allow_train and len(payload["train_fake"]) >= max_train and len(payload["val_fake"]) >= 150:
-            log(f"{split} hit the train cap ({max_train})")
+        if allow_train and sum(payload["train_counts"].values()) >= max_train and len(payload["val_fake"]) >= 150:
+            log(f"{split} hit the DRAGON train cap ({max_train})")
             break
         model = example_model(ex)
         key = example_key(ex, model)
@@ -315,12 +341,25 @@ def _fill_dragon(split, holdouts, quota_for, payload, seen, log, max_scan, allow
 def prepare(args, log=print) -> dict:
     holdouts = [normalize(part) for part in args.holdout.split(",") if part.strip()]
     existing = _load_partial()
+    dragon_target = int(getattr(args, "dragon_train", 160000))
+    v2_target = int(getattr(args, "v2_total", 70000))
     if existing and existing.get("complete") and not args.smoke:
+        same = existing.get("dragon_target") == dragon_target and existing.get("v2_target") == v2_target
+        if same:
+            log(
+                "using cached manifest "
+                f"({len(existing['train_fake'])} train fakes, {len(existing['train_real'])} train reals)"
+            )
+            return existing
         log(
-            "using cached manifest "
-            f"({len(existing['train_fake'])} train fakes, {len(existing['train_real'])} train reals)"
+            "cached mix is the smaller run "
+            f"({len(existing.get('train_fake') or [])} fakes). "
+            f"rebuilding {dragon_target} DRAGON + {v2_target} June 2026 images."
         )
-        return existing
+        existing["train_fake"] = []
+        existing["train_counts"] = {}
+        existing["seen"] = []
+        existing["complete"] = False
 
     payload = existing or {
         "complete": False,
@@ -341,8 +380,11 @@ def prepare(args, log=print) -> dict:
             return args.holdout_val if kind == "val" else 0
         return args.val_per_model if kind == "val" else args.per_model
 
-    max_train = args.per_model * 30
+    max_train = dragon_target
     max_val = args.val_per_model * 30 + args.holdout_val
+    payload["dragon_target"] = dragon_target
+    payload["v2_target"] = v2_target
+    log(f"target {dragon_target} DRAGON train fakes, at most {args.per_model} per generator, plus {v2_target} June 2026 images")
     log("streaming DRAGON test split into the val cache")
     try:
         _fill_dragon(
@@ -359,7 +401,11 @@ def prepare(args, log=print) -> dict:
 
     v2_root = Path(args.v2_root) if args.v2_root else Path("/kaggle/input")
     if v2_root.is_dir():
-        v2_reals, v2_fakes = scan_v2(v2_root, args.v2_per_gen, log)
+        v2_reals, v2_fakes = scan_v2(
+            v2_root, args.v2_per_gen, log, max_real=v2_target, max_fake=v2_target,
+        )
+        v2_reals, v2_fakes = _take_v2(v2_reals, v2_fakes, v2_target)
+        log(f"June 2026 kept reals={len(v2_reals)} fakes={len(v2_fakes)} (target {v2_target})")
     else:
         v2_reals, v2_fakes = [], []
         log("no v2 folder. training without the June 2026 paired set.")
@@ -393,12 +439,14 @@ def prepare(args, log=print) -> dict:
     payload["val_real"] = reals[:n_val_real]
     payload["train_real"] = reals[n_val_real:]
     have = {item["path"] for item in payload["train_fake"]}
-    v2_counts: dict[str, int] = {}
+    added_v2 = 0
     for path, gen in v2_fakes:
-        if path in have or v2_counts.get(gen, 0) >= args.v2_per_gen:
+        if path in have:
             continue
-        v2_counts[gen] = v2_counts.get(gen, 0) + 1
+        have.add(path)
         payload["train_fake"].append({"path": path, "gen": f"v2_{gen}"})
+        added_v2 += 1
+    log(f"added {added_v2} June 2026 fakes")
 
     if len(payload["train_fake"]) < 32:
         raise RuntimeError(
