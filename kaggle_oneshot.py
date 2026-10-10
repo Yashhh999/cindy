@@ -32,7 +32,7 @@ subprocess.check_call([
     "torchrun", "--standalone", "--nproc_per_node=2", "-m", "cindy.train",
     "--hf-repo", "Yashhh999/cindy",
     "--save-every", "50",
-    "--hf-every", "400",
+    "--hf-every", "2000",
     "--batch-size", "16",
     "--max-steps", "8000",
     "--dragon-train", "160000",

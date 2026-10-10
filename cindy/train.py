@@ -33,7 +33,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--hf-repo", default="Yashhh999/cindy")
     p.add_argument("--save-every", type=int, default=50)
-    p.add_argument("--hf-every", type=int, default=400)
+    p.add_argument("--hf-every", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--max-steps", type=int, default=8000)
