@@ -138,6 +138,13 @@ class Uploader:
             meta = snap.parent / "latest.json"
             if meta.is_file():
                 files.append((meta, "latest.json"))
+            best = snap.parent / "best.pt"
+            best_snap = snap.parent / ".upload_best.pt"
+            if best.is_file() and best.stat().st_size > 0:
+                best_snap.write_bytes(best.read_bytes())
+                files.append((best_snap, "best.pt"))
+            else:
+                best_snap = None
             files.extend(extras)
             try:
                 self._commit(api, files)
@@ -148,6 +155,8 @@ class Uploader:
                 self.log(f"[hf] upload failed (training continues): {exc}")
             finally:
                 snap.unlink(missing_ok=True)
+                if best_snap is not None:
+                    best_snap.unlink(missing_ok=True)
                 for local, _name in extras:
                     local.unlink(missing_ok=True)
 
