@@ -165,28 +165,34 @@ def _copy_replay(src: Path, key: str, cap: int):
 
 
 def fill_era(progress: dict, args, log=print) -> dict:
-    """Save this era until the disk is low, the caps are met, or the stream ends."""
+    """Save the next chunk of core/train. No per-generator cap unless --per-gen is set."""
+    one_pass = bool(getattr(args, "one_pass", True))
+    chunk_target = int(getattr(args, "chunk", 0) or 0)
+    per_gen = int(getattr(args, "per_gen", 0) or 0)
     names = era_names()
-    index = int(progress["era_index"])
-    if index >= len(names):
-        progress["done"] = True
-        return progress
-    era = names[index]
+    index = int(progress.get("era_index") or 0)
+    if one_pass:
+        era = "all"
+    else:
+        if index >= len(names):
+            progress["done"] = True
+            return progress
+        era = names[index]
     progress["era"] = era
     scanned = int(progress.get("scanned") or 0)
     counts = dict(progress.get("gen_counts") or {})
     reals = int(progress.get("real_count") or 0)
-    log(f"fill era {era} from row {scanned}  gens={len(counts)} reals={reals}")
+    fakes_this = 0
+    reals_this = 0
+    log(f"fill chunk {progress.get('chunk', 0)} from row {scanned}")
     stream = _open_train_stream()
     folder = era_image_dir(era)
     kept_since_log = 0
-    seen_rows = 0
     for row_i, row in enumerate(stream):
         if row_i < scanned:
             if row_i > 0 and row_i % 50000 == 0:
                 log(f"catch-up {row_i}/{scanned}")
             continue
-        seen_rows += 1
         progress["scanned"] = row_i + 1
         if row_i > 0 and row_i % 5000 == 0:
             save_progress(progress)
@@ -198,10 +204,10 @@ def fill_era(progress: dict, args, log=print) -> dict:
         if real is False and is_holdout(model):
             continue
         if real is False:
-            if era_index_for("fake", row.get("release_date")) != index:
+            if not one_pass and era_index_for("fake", row.get("release_date")) != index:
                 continue
             key = model_key(model) or "unknown"
-            if counts.get(key, 0) >= args.per_gen:
+            if per_gen and counts.get(key, 0) >= per_gen:
                 continue
             image = _as_image(row.get("image"))
             if image is None:
@@ -211,8 +217,9 @@ def fill_era(progress: dict, args, log=print) -> dict:
             _save_jpeg(image, dest)
             _copy_replay(dest, key[:48], args.replay_per)
             counts[key] = counts.get(key, 0) + 1
+            fakes_this += 1
             kept_since_log += 1
-        elif real is True and reals < sum(counts.values()):
+        elif real is True and reals_this < fakes_this:
             image = _as_image(row.get("image"))
             if image is None:
                 continue
@@ -221,19 +228,21 @@ def fill_era(progress: dict, args, log=print) -> dict:
             _save_jpeg(image, dest)
             _copy_replay(dest, "real", args.replay_per * 4)
             reals += 1
+            reals_this += 1
             kept_since_log += 1
+        saved = fakes_this + reals_this
         if kept_since_log >= 200:
             progress["gen_counts"] = counts
             progress["real_count"] = reals
-            log(f"era {era} scanned={progress['scanned']} fakes={sum(counts.values())} reals={reals} free={free_gb():.1f}GB")
+            log(f"chunk {progress.get('chunk', 0)} scanned={progress['scanned']} saved={saved} free={free_gb():.1f}GB")
             save_progress(progress)
             kept_since_log = 0
-        if seen_rows >= args.scan_chunk and sum(counts.values()) > 0 and reals > 0:
-            log(f"scan chunk {args.scan_chunk} reached")
+        if chunk_target and saved >= chunk_target:
+            log(f"chunk full ({saved} images)")
             break
     else:
         progress["stream_done"] = True
-        log(f"era {era} stream finished")
+        log("core/train stream finished")
     progress["gen_counts"] = counts
     progress["real_count"] = reals
     progress["era"] = era

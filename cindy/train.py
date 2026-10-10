@@ -57,10 +57,11 @@ def parse_args():
     p.add_argument("--hf-every", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--steps-per-era", type=int, default=4000)
-    p.add_argument("--per-gen", type=int, default=2000)
+    p.add_argument("--steps-per-era", type=int, default=0)
+    p.add_argument("--per-gen", type=int, default=0)
+    p.add_argument("--chunk", type=int, default=20000)
     p.add_argument("--replay-per", type=int, default=300)
-    p.add_argument("--scan-chunk", type=int, default=200000)
+    p.add_argument("--one-pass", action="store_true", default=True)
     p.add_argument("--min-free-gb", type=float, default=3.0)
     p.add_argument("--lr-lora", type=float, default=1e-4)
     p.add_argument("--lr-head", type=float, default=1e-3)
@@ -191,11 +192,11 @@ def evaluate(model, loader, device):
     return {"acc": acc, "auc": binary_auc(y, s), "n": int(len(y))}
 
 
-def set_lr(opt, step, args):
+def set_lr(opt, step, args, total):
     if step < args.warmup:
         scale = step / max(1, args.warmup)
     else:
-        span = max(1, args.steps_per_era - args.warmup)
+        span = max(1, total - args.warmup)
         progress = min(1.0, (step - args.warmup) / span)
         scale = 0.5 * (1 + math.cos(math.pi * progress))
     for group, base in zip(opt.param_groups, (args.lr_lora, args.lr_head)):
@@ -260,16 +261,35 @@ def load_checkpoint(model, opt, scaler, path: Path, device):
     return ckpt
 
 
+def adopt_one_pass(progress, log):
+    if progress.get("one_pass"):
+        return progress
+    log("switching to a full core/train pass. scan restarts at row 0. weights kept.")
+    for name in list(era_names()) + ["all"]:
+        delete_era_files(name, log=log)
+    progress["one_pass"] = True
+    progress["era"] = "all"
+    progress["era_index"] = 0
+    progress["scanned"] = 0
+    progress["stream_done"] = False
+    progress["done"] = False
+    progress["gen_counts"] = {}
+    progress["real_count"] = 0
+    progress["step_in_era"] = 0
+    progress["chunk"] = 0
+    return progress
+
+
 def startup(args, log):
     local_progress = load_progress()
     if local_progress and local_progress.get("arch") == ARCH:
         log(f"resume local era={local_progress.get('era')} step={local_progress.get('global_step')}")
-        return local_progress, find_local()
+        return adopt_one_pass(local_progress, log), find_local()
     remote = download_progress(args.hf_repo, log=log)
     if remote and remote.get("arch") == ARCH:
         path = download_hf(args.hf_repo, log=log)
         log(f"resume huggingface era={remote.get('era')} step={remote.get('global_step')}")
-        return remote, path
+        return adopt_one_pass(remote, log), path
     token = hf_token()
     if token:
         delete_remote_weights(args.hf_repo, token, log=log)
@@ -279,8 +299,10 @@ def startup(args, log):
         old.unlink()
         log("removed local v1 checkpoint")
     progress = fresh_progress(ARCH)
+    progress["one_pass"] = True
+    progress["era"] = "all"
     save_progress(progress)
-    log("fresh v2. eras: " + ",".join(era_names()))
+    log("fresh one-pass over core/train")
     return progress, None
 
 
@@ -445,8 +467,9 @@ def main():
         if rank == 0 and val_items:
             val_loader = DataLoader(ListDataset(val_items, train=False), batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-        target = int(progress["step_in_era"]) + args.steps_per_era
-        log(rank, f"train era {progress['era']} steps {progress['step_in_era']} -> {target}")
+        span = args.steps_per_era if args.steps_per_era > 0 else max(200, len(train_items) // max(1, args.batch_size * world))
+        target = int(progress["step_in_era"]) + span
+        log(rank, f"train chunk {progress.get('chunk', 0)} steps {progress['step_in_era']} -> {target}")
         model.train()
         epoch = 0
         done_steps = False
@@ -461,7 +484,7 @@ def main():
                 images = images.to(device, non_blocking=True)
                 target_y = target_y.to(device, non_blocking=True)
                 smooth = target_y * 0.96 + 0.02
-                set_lr(opt, int(progress["step_in_era"]), args)
+                set_lr(opt, int(progress["step_in_era"]), args, target)
                 opt.zero_grad(set_to_none=True)
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
                     main, aux = model(images)
@@ -503,11 +526,13 @@ def main():
         if rank == 0:
             dump("era-chunk")
             if progress.get("stream_done"):
-                progress = advance_era(progress, log=lambda m: log(0, m))
+                progress["done"] = True
+                log(0, f"core/train finished at step {progress['global_step']}")
             else:
                 delete_era_files(progress["era"], log=lambda m: log(0, m))
                 progress["step_in_era"] = 0
-                log(0, f"freed {progress['era']} images. replay kept. scan continues at {progress['scanned']}")
+                progress["chunk"] = int(progress.get("chunk") or 0) + 1
+                log(0, f"freed chunk. replay kept. next chunk {progress['chunk']} at row {progress['scanned']}")
             save_progress(progress)
         if world > 1:
             dist.barrier()
