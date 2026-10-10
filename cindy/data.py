@@ -14,7 +14,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from cindy.checkpoint import data_dir, replay_dir
+from cindy.checkpoint import data_dir, replay_dir, save_progress
 
 HOLDOUT = {
     "gptimage15",
@@ -188,6 +188,8 @@ def fill_era(progress: dict, args, log=print) -> dict:
             continue
         seen_rows += 1
         progress["scanned"] = row_i + 1
+        if row_i > 0 and row_i % 5000 == 0:
+            save_progress(progress)
         if free_gb() < args.min_free_gb:
             log(f"disk low ({free_gb():.1f} GB free). stop fill.")
             break
@@ -224,6 +226,7 @@ def fill_era(progress: dict, args, log=print) -> dict:
             progress["gen_counts"] = counts
             progress["real_count"] = reals
             log(f"era {era} scanned={progress['scanned']} fakes={sum(counts.values())} reals={reals} free={free_gb():.1f}GB")
+            save_progress(progress)
             kept_since_log = 0
         if seen_rows >= args.scan_chunk and sum(counts.values()) > 0 and reals > 0:
             log(f"scan chunk {args.scan_chunk} reached")

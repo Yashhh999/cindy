@@ -14,6 +14,7 @@ import os
 import random
 import signal
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -79,7 +80,7 @@ def init_dist():
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
     if "RANK" not in os.environ:
         return 0, 1, 0
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
     rank = dist.get_rank()
     world = dist.get_world_size()
     local = int(os.environ.get("LOCAL_RANK", 0))
@@ -307,6 +308,26 @@ def advance_era(progress, log):
     return progress
 
 
+def wait_for_rank0(rank, world):
+    """Rank 1 sleeps until rank 0 publishes. No NCCL call, so a long download cannot time out."""
+    if world <= 1:
+        return
+    ready = ckpt_dir() / "rank1.ready"
+    go = ckpt_dir() / "rank0.go"
+    if rank != 0:
+        ready.write_text("1")
+        while not go.is_file():
+            time.sleep(2)
+        go.unlink(missing_ok=True)
+        ready.unlink(missing_ok=True)
+        return
+    while not ready.is_file():
+        time.sleep(2)
+    go.write_text("1")
+    while ready.is_file():
+        time.sleep(1)
+
+
 def main():
     args = parse_args()
     rank, world, local = init_dist()
@@ -377,23 +398,23 @@ def main():
         signal.signal(signal.SIGINT, on_signal)
 
     while not progress.get("done"):
-        if rank == 0 and not progress.get("stream_done"):
-            progress = fill_era(progress, args, log=lambda m: log(0, m))
-            save_progress(progress)
-            fakes = sum((progress.get("gen_counts") or {}).values())
-            log(0, f"era {progress['era']} fakes={fakes} reals={progress['real_count']} scanned={progress['scanned']}")
-        if world > 1:
-            dist.barrier()
-            progress = load_progress()
+        if rank == 0:
+            (ckpt_dir() / "rank0.go").unlink(missing_ok=True)
+            if not progress.get("stream_done"):
+                progress = fill_era(progress, args, log=lambda m: log(0, m))
+                save_progress(progress)
+                fakes = sum((progress.get("gen_counts") or {}).values())
+                log(0, f"era {progress['era']} fakes={fakes} reals={progress['real_count']} scanned={progress['scanned']}")
+        wait_for_rank0(rank, world)
+        progress = load_progress()
 
         if progress.get("stream_done") and not era_ready(progress):
             if rank == 0:
                 log(0, f"era {progress['era']} has nothing to train. advancing.")
                 progress = advance_era(progress, log=lambda m: log(0, m))
                 save_progress(progress)
-            if world > 1:
-                dist.barrier()
-                progress = load_progress()
+            wait_for_rank0(rank, world)
+            progress = load_progress()
             continue
 
         train_items, val_items = list_split(progress["era"])
@@ -404,9 +425,8 @@ def main():
                 if progress.get("stream_done"):
                     progress = advance_era(progress, log=lambda m: log(0, m))
                     save_progress(progress)
-            if world > 1:
-                dist.barrier()
-                progress = load_progress()
+            wait_for_rank0(rank, world)
+            progress = load_progress()
             continue
 
         train_ds = ListDataset(train_items, train=True)
